@@ -1,6 +1,14 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ConfigEnv, ResolvedConfig, UserConfig } from 'vite';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { analyzeApplicationSync } from '../../src/application-analysis.ts';
@@ -66,9 +74,10 @@ function fakeDevServer(moduleIds: Array<string> = []) {
   const invalidated: Array<string> = [];
   const restart = vi.fn(async () => {});
   const logError = vi.fn();
+  const logWarn = vi.fn();
   const modules = new Map(moduleIds.map((id) => [id, { id }]));
   const server = {
-    config: { logger: { error: logError } },
+    config: { logger: { error: logError, warn: logWarn } },
     watcher: {
       on(event: string, handler: (path: string) => Promise<void> | void) {
         handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -94,7 +103,7 @@ function fakeDevServer(moduleIds: Array<string> = []) {
       await handler(path);
     }
   }
-  return { server, invalidated, restart, emit, logError };
+  return { server, invalidated, restart, emit, logError, logWarn };
 }
 
 function startDevServer(plugin: RoutingPlugin, moduleIds?: Array<string>) {
@@ -433,7 +442,7 @@ describe('routingPlugin', () => {
       rmSync(typesPath);
       mkdirSync(typesPath);
     } else if (failure === 'auth generation') {
-      vi.spyOn(authConfig, 'loadVoidAuthConfig').mockRejectedValueOnce(
+      vi.spyOn(authConfig, 'loadVoidAuthConfigWithDependencies').mockRejectedValueOnce(
         new Error('Transient auth generation failure'),
       );
     } else {
@@ -575,10 +584,10 @@ describe('routingPlugin', () => {
       started = resolve;
     });
     let resume!: () => void;
-    const pause = new Promise<undefined>((resolve) => {
-      resume = () => resolve(undefined);
+    const pause = new Promise<authConfig.LoadedVoidAuthConfig>((resolve) => {
+      resume = () => resolve({ config: undefined, dependencies: [], restartRequired: [] });
     });
-    vi.spyOn(authConfig, 'loadVoidAuthConfig').mockImplementationOnce(() => {
+    vi.spyOn(authConfig, 'loadVoidAuthConfigWithDependencies').mockImplementationOnce(() => {
       started();
       return pause;
     });
@@ -606,6 +615,93 @@ describe('routingPlugin', () => {
     expect(readFileSync(typesPath, 'utf8')).toContain('POST: {');
     expect(readFileSync(typesPath, 'utf8')).not.toContain('DELETE: {');
     expect(invalidated).toEqual(['virtual:void-routes']);
+  });
+
+  it('regenerates auth files when the auth config or a file it imports changes', async () => {
+    const root = createTempRoot();
+    const routePath = join(root, 'routes', 'health.ts');
+    writeFileSync(routePath, 'export const GET = () => new Response();');
+    const authPath = readProjectPaths(root).authConfigCandidates[0]!;
+    const helperPath = join(dirname(authPath), 'auth-fields.ts');
+    const createdPath = join(dirname(authPath), 'auth-created.ts');
+    const legacyPath = join(dirname(authPath), 'auth-legacy.cjs');
+    const latePath = join(dirname(authPath), 'auth-late.ts');
+    writeFileSync(authPath, "export type {} from 'void/auth';");
+    writeFileSync(helperPath, '');
+    writeFileSync(legacyPath, '');
+    let dependencies = [helperPath, legacyPath];
+    let pause: Promise<void> | undefined;
+    // Evaluating real files is covered by auth-config-loader.test.ts; vitest's
+    // module runner bypasses the Node hook the loader uses.
+    let field: string | Error = 'nickname';
+    const load = vi
+      .spyOn(authConfig, 'loadVoidAuthConfigWithDependencies')
+      .mockImplementation(async () => {
+        await pause;
+        if (field instanceof Error) {
+          throw field;
+        }
+        return {
+          config: { user: { additionalFields: { [field]: { type: 'string' } } } },
+          dependencies: dependencies.map((path) => realpathSync(path)),
+          restartRequired: [realpathSync(legacyPath)],
+        };
+      });
+
+    const plugin = createRoutingPlugin(root, { isAuthEnabled: () => true });
+    resolveConfig(plugin, 'serve');
+    await runBuildStart(plugin);
+    const schemaPath = join(root, '.void', 'better-auth-schema.ts');
+    expect(readFileSync(schemaPath, 'utf8')).toContain('"nickname"');
+    const { emit, logError, logWarn } = startDevServer(plugin, ['virtual:void-routes']);
+
+    field = 'bio';
+    await emit('change', authPath);
+    expect(readFileSync(schemaPath, 'utf8')).toContain('"bio"');
+
+    field = 'displayName';
+    await emit('change', helperPath);
+    expect(readFileSync(schemaPath, 'utf8')).toContain('"displayName"');
+
+    // Other source files do not reload the config.
+    const loads = load.mock.calls.length;
+    await emit('change', routePath);
+    expect(load).toHaveBeenCalledTimes(loads);
+
+    // After a failed load, a file it never reached (one being created) retries it.
+    field = new Error("Cannot find module './auth-created.ts'");
+    await emit('change', helperPath);
+    expect(logError).toHaveBeenCalledTimes(1);
+    field = 'avatar';
+    writeFileSync(createdPath, '');
+    await emit('add', createdPath);
+    expect(readFileSync(schemaPath, 'utf8')).toContain('"avatar"');
+
+    // Once it loads again, only its own files count.
+    await emit('change', routePath);
+    expect(load).toHaveBeenCalledTimes(loads + 2);
+
+    // Node keeps CommonJS files cached, so their edits ask for a restart.
+    await emit('change', legacyPath);
+    expect(logWarn).toHaveBeenCalledWith(
+      expect.stringContaining('auth-legacy.cjs is loaded as CommonJS'),
+      expect.anything(),
+    );
+
+    // A file saved while a load runs, which that load then reports, reloads again.
+    let finish = () => {};
+    pause = new Promise((resolve) => {
+      finish = resolve;
+    });
+    writeFileSync(latePath, '');
+    const loading = emit('change', authPath);
+    await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(loads + 3));
+    dependencies = [helperPath, latePath];
+    const lateSave = emit('change', latePath);
+    pause = undefined;
+    finish();
+    await Promise.all([loading, lateSave]);
+    expect(load).toHaveBeenCalledTimes(loads + 4);
   });
 
   it.each([

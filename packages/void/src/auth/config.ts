@@ -1,9 +1,9 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import { parseSync } from 'vite';
 import { readProjectPaths, type ProjectPaths } from '../project-paths.ts';
 import type { VoidAuthConfig } from '../runtime/auth.ts';
 import type { AstNode, AstProgram } from '../shared/ast.ts';
+import { importFresh } from './fresh-import.ts';
 
 function isVoidAuthConfigSource(code: string, filename: string): boolean {
   if (!code.includes('void/auth')) {
@@ -43,12 +43,34 @@ export function findVoidAuthConfig(
   return null;
 }
 
+export type LoadedVoidAuthConfig = {
+  config: VoidAuthConfig | undefined;
+  /** Local files the config imported, the config file excluded. */
+  dependencies: Array<string>;
+  /** Local files, the config included, whose edits only a restart picks up. */
+  restartRequired: Array<string>;
+};
+
+/**
+ * Evaluate the auth config from its current source, and the current source of
+ * the local files it imports, so a dev server picks up saved edits.
+ */
+export async function loadVoidAuthConfigWithDependencies(
+  configPath: string | null,
+): Promise<LoadedVoidAuthConfig> {
+  if (!configPath) {
+    return { config: undefined, dependencies: [], restartRequired: [] };
+  }
+  const { module, dependencies, restartRequired } = await importFresh(configPath);
+  return {
+    config: (module.default ?? module.auth ?? module.config) as VoidAuthConfig | undefined,
+    dependencies,
+    restartRequired,
+  };
+}
+
 export async function loadVoidAuthConfig(
   configPath: string | null,
 ): Promise<VoidAuthConfig | undefined> {
-  if (!configPath) {
-    return undefined;
-  }
-  const mod = await import(pathToFileURL(configPath).href);
-  return (mod.default ?? mod.auth ?? mod.config) as VoidAuthConfig | undefined;
+  return (await loadVoidAuthConfigWithDependencies(configPath)).config;
 }

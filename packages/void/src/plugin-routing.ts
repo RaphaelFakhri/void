@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, resolve } from 'pathslash';
@@ -16,7 +24,7 @@ import {
   isGeneratedAssetHeaders,
   resolveAssetWorkerBypass,
 } from './asset-worker-bypass.ts';
-import { loadVoidAuthConfig } from './auth/config.ts';
+import { loadVoidAuthConfigWithDependencies, type LoadedVoidAuthConfig } from './auth/config.ts';
 import { resolveDistDir, resolveWorkerDirName } from './cli/build-output-dir.ts';
 import { lintRoutingPhases, mergeRoutingRules } from './cli/headers.ts';
 import { stampClientAssetCachePolicy } from './client-asset-manifest.ts';
@@ -68,6 +76,15 @@ const RESOLVE_ID_FILTER =
   /^(virtual:void-(routes|client-worker(?::(react|vue|svelte|solid))?|client-browser(?::(react|vue|svelte|solid))?)|void(\/client(\/(react|vue|svelte|solid))?|\/queues)?)$/;
 const LOAD_ID_FILTER =
   /^virtual:void-(routes|client-worker(?::(react|vue|svelte|solid))?|client-browser(?::(react|vue|svelte|solid))?)$/;
+
+const SCRIPT_EXTENSIONS = ['.ts', '.mts', '.cts', '.tsx', '.js', '.mjs', '.cjs', '.jsx', '.json'];
+
+function isScriptPath(path: string): boolean {
+  return (
+    !path.includes('/node_modules/') &&
+    SCRIPT_EXTENSIONS.some((extension) => path.endsWith(extension))
+  );
+}
 
 type RoutingPluginOptions = {
   getApplicationAnalysis: (environment: RouteEnvironment, refresh?: boolean) => ApplicationAnalysis;
@@ -144,6 +161,14 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
   const pagesDir = paths.pagesDir;
   const ssrDir = paths.ssrDir;
   const authConfigPaths = new Set(paths.authConfigCandidates.map((path) => normalizePath(path)));
+  // Local files the auth config imported when it was last loaded.
+  let authConfigDependencies = new Set<string>();
+  // Those of them Node keeps cached (CommonJS, `require()`) until a restart.
+  let authConfigRestartFiles = new Set<string>();
+  // A failed load may stop at a missing or broken file it never reported.
+  let authConfigLoadFailed = false;
+  // A file saved during a load may be one the load is about to report.
+  let authConfigLoading = false;
   const envFilePaths = new Set(paths.envFileCandidates.map((path) => normalizePath(path)));
   const normalizedRoutesDir = normalizePath(routesDir);
   const normalizedMiddlewareDir = normalizePath(middlewareDir);
@@ -320,16 +345,33 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
 
   async function writeAuthDatabaseFiles(): Promise<void> {
     if (!compileOptions.auth) {
+      authConfigDependencies = new Set();
+      authConfigRestartFiles = new Set();
+      authConfigLoadFailed = false;
       return;
     }
 
     // Better Auth's schema helpers load zod and most of better-auth; only auth apps need them.
     const { generateVoidAuthDatabaseModule, generateVoidAuthDrizzleSchema } =
       await import('./auth/drizzle.ts');
+    let loaded: LoadedVoidAuthConfig;
+    authConfigLoading = true;
+    try {
+      loaded = await loadVoidAuthConfigWithDependencies(compileOptions.auth.authConfigPath);
+    } catch (error) {
+      authConfigLoadFailed = true;
+      throw error;
+    } finally {
+      authConfigLoading = false;
+    }
+    authConfigLoadFailed = false;
+    // A helper the config imports changes the generated schema like the config does.
+    authConfigDependencies = new Set(loaded.dependencies.map((path) => normalizePath(path)));
+    authConfigRestartFiles = new Set(loaded.restartRequired.map((path) => normalizePath(path)));
     const authRuntime: VoidAuthRuntimeOptions = {
       dialect: compileOptions.auth.dialect,
       providers: compileOptions.auth.providers,
-      userConfig: await loadVoidAuthConfig(compileOptions.auth.authConfigPath),
+      userConfig: loaded.config,
     };
     const local = resolvedConfig?.command === 'serve' ? loadLocalEnv(root) : {};
     const env = { ...local, ...process.env } as Record<string, unknown>;
@@ -387,7 +429,32 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
   }
 
   function isPotentialAuthConfigPath(path: string): boolean {
-    return authConfigPaths.has(normalizePath(path));
+    const normalized = normalizePath(path);
+    if (authConfigPaths.has(normalized)) {
+      return true;
+    }
+    if ((authConfigLoadFailed || authConfigLoading) && isScriptPath(normalized)) {
+      // Creating or fixing the file the last load stopped at must retry it.
+      return true;
+    }
+    return isAuthConfigFile(authConfigDependencies, normalized);
+  }
+
+  function isAuthConfigFile(files: Set<string>, normalized: string): boolean {
+    if (files.size === 0) {
+      return false;
+    }
+    if (files.has(normalized)) {
+      return true;
+    }
+    // The loader reports real paths; the watcher reports them under the root as
+    // written, which can go through a symlink.
+    try {
+      return files.has(normalizePath(realpathSync(normalized)));
+    } catch {
+      // A deleted file keeps the path the watcher gave.
+      return false;
+    }
   }
 
   function isPotentialEnvFilePath(path: string): boolean {
@@ -848,6 +915,12 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
       const handleFileChange = async (path: string, event: 'add' | 'change' | 'unlink') => {
         const normalizedPath = normalizePath(path);
         invalidateSourceAnalysis(normalizedPath);
+        if (event === 'change' && isAuthConfigFile(authConfigRestartFiles, normalizedPath)) {
+          devServer.config.logger.warn(
+            `auth: ${relative(root, normalizedPath)} is loaded as CommonJS or with require(); restart the dev server to apply its changes.`,
+            { timestamp: true },
+          );
+        }
 
         const sourceConventionChanged =
           isInDirectory(normalizedPath, normalizedRoutesDir) ||
