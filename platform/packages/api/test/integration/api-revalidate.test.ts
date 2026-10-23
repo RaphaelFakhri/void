@@ -12,6 +12,7 @@ import {
 } from 'vite-plus/test';
 import { hmacSignState } from '../../src/auth/hmac.ts';
 import app from '../../src/index.ts';
+import { createIsrStore } from '../../src/isr-store.ts';
 import { domains, projectMembers } from '../../src/schema.ts';
 import {
   setupEnv,
@@ -64,6 +65,47 @@ afterEach(() => {
 });
 
 describe('POST /projects/:id/revalidate', () => {
+  it.each([false, true])('purges R2 pages and legacy KV edge variants (all=%s)', async (all) => {
+    const user = await createTestUser(env.db);
+    const project = await createTestProject(env.db, user.id);
+    const deployment = await createTestDeployment(env.db, project.id, 'live');
+    const host = `${project.slug}.void.app`;
+    const direct = isrKey(project.id, deployment.id, host, 'docs');
+    const variant = `${direct}#rw=${hashOriginalUrl(`https://${host}/old-docs`)}`;
+    const legacy = `${legacyIsrKey(project.id, deployment.id, 'docs')}#rw=${hashOriginalUrl(`https://${host}/legacy-docs`)}`;
+    const cache = createIsrStore(env.STATIC_ASSETS_R2);
+    for (const key of [direct, variant]) {
+      await cache.put(key, new ArrayBuffer(4), {
+        metadata: { s: 200, c: Date.now(), t: 600, p: 3 },
+      });
+    }
+    await env.ISR_CACHE.put(legacy, 'legacy body');
+    const fetchMock = mockCfApi();
+    const response = await app.fetch(
+      new Request(`http://localhost/projects/${project.id}/revalidate`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${user.jwt}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(all ? { all: true } : { paths: ['/docs'] }),
+      }),
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ purged: 1 });
+    expect((await cache.getWithMetadata(direct)).value).toBeNull();
+    expect((await cache.getWithMetadata(variant)).value).toBeNull();
+    expect(await env.ISR_CACHE.get(legacy)).toBeNull();
+    const urls = fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/purge_cache'))
+      .flatMap(([, options]) => JSON.parse(options!.body as string).files as Array<string>);
+    expect(urls).toContain(`https://${host}/docs?__void_isr=${deployment.id}`);
+    expect(urls).toContain(
+      `https://${host}/docs?__void_isr=${deployment.id}&__void_orig=${hashOriginalUrl(`https://${host}/old-docs`)}`,
+    );
+    expect(urls).toContain(
+      `https://${host}/docs?__void_isr=${deployment.id}&__void_orig=${hashOriginalUrl(`https://${host}/legacy-docs`)}`,
+    );
+  });
+
   it('returns 401 without auth', async () => {
     const res = await app.fetch(
       new Request('http://localhost/projects/proj_fake/revalidate', {

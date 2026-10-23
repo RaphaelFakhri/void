@@ -163,39 +163,41 @@ function createEnv(options: {
     DISPATCH: {
       get: dispatchGet,
     },
-    ISR_CACHE: {
-      getWithMetadata: async (key: string) => {
-        const entry = kvStore.get(key);
+    STATIC_ASSETS_R2: {
+      get: async (key: string) => {
+        const entry = kvStore.get(key.slice('isr-cache/'.length));
         if (!entry) {
-          return { value: null, metadata: null };
+          return null;
         }
-        return { value: entry.value, metadata: entry.metadata };
+        return {
+          arrayBuffer: async () => entry.value,
+          customMetadata: { isr: JSON.stringify(entry.metadata) },
+        };
       },
-      put: async (key: string, value: ArrayBuffer, opts?: { metadata?: unknown }) => {
-        kvStore.set(key, {
+      put: async (key: string, value: ArrayBuffer, opts: { customMetadata: { isr: string } }) => {
+        kvStore.set(key.slice('isr-cache/'.length), {
           value,
-          metadata: opts?.metadata as {
-            s: number;
-            c: number;
-            t: number;
-            p: typeof SHARED_CACHE_POLICY_VERSION;
-          },
+          metadata: JSON.parse(opts.customMetadata.isr),
         });
       },
       delete: async (key: string) => {
-        kvStore.delete(key);
+        kvStore.delete(key.slice('isr-cache/'.length));
       },
       list: async (opts: { prefix: string; limit?: number }) => {
-        const all = [...kvStore.keys()].filter((k) => k.startsWith(opts.prefix)).sort();
+        const all = [...kvStore.keys()]
+          .map((key) => `isr-cache/${key}`)
+          .filter((key) => key.startsWith(opts.prefix))
+          .sort();
         const limit = opts.limit ?? 1000;
         const slice = all.slice(0, limit);
         return {
-          keys: slice.map((name) => ({ name })),
-          list_complete: slice.length === all.length,
+          objects: slice.map((key) => ({ key })),
+          truncated: slice.length !== all.length,
           cursor: '',
         };
       },
     },
+    ISR_CACHE: { delete: async () => {} },
     ANALYTICS: {
       writeDataPoint: (data: unknown) => analyticsWrites.push(data),
     },
@@ -470,6 +472,26 @@ describe('custom domain routing', () => {
 });
 
 describe('ISR (stale-while-revalidate)', () => {
+  it('does not resurrect a purged 600-second page from stale legacy KV', async () => {
+    const { env, workerFetch } = createEnv({
+      routing: { workerName: 'user-app', projectId: 'proj_1', ssr: true, revalidate: 600 },
+      workerResponse: new Response('<html>fresh after purge</html>'),
+    });
+    const staleRead = vi.fn(async () =>
+      packMockEntry({
+        body: '<html>deleted but still visible in KV</html>',
+        createdAt: Date.now(),
+        ttl: 600,
+      }),
+    );
+    Object.assign(env.ISR_CACHE, { getWithMetadata: staleRead });
+    const response = await app.fetch(new Request('https://my-app.void.app/page'), env, createCtx());
+    expect(await response.text()).toBe('<html>fresh after purge</html>');
+    expect(response.headers.get('x-isr-cache')).toBe('MISS');
+    expect(workerFetch).toHaveBeenCalledOnce();
+    expect(staleRead).not.toHaveBeenCalled();
+  });
+
   it('keeps framework data requests separate from a cached document at the same URL', async () => {
     let renders = 0;
     const { env, workerFetch } = createEnv({
@@ -874,7 +896,7 @@ describe('ISR (stale-while-revalidate)', () => {
         headers: { 'Content-Type': 'text/html' },
       }),
     });
-    vi.spyOn(env.ISR_CACHE, 'getWithMetadata').mockRejectedValueOnce(new Error('KV unavailable'));
+    vi.spyOn(env.STATIC_ASSETS_R2, 'get').mockRejectedValueOnce(new Error('R2 unavailable'));
 
     const response = await app.fetch(
       new Request('https://my-app.void.app/dashboard'),
