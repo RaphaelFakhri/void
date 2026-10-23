@@ -48,6 +48,19 @@ describe('managed ISR storage', () => {
     expect(legacyDelete).toHaveBeenCalledWith('key');
   });
 
+  it('propagates authoritative R2 deletion failures before attempting legacy cleanup', async () => {
+    const failure = new Error('R2 unavailable');
+    const remove = vi.fn().mockRejectedValue(failure);
+    const legacyDelete = vi.fn();
+    const store = createIsrStore(
+      { delete: remove } as unknown as R2Bucket,
+      { delete: legacyDelete } as unknown as KVNamespace,
+    );
+
+    await expect(store.delete('key')).rejects.toBe(failure);
+    expect(legacyDelete).not.toHaveBeenCalled();
+  });
+
   it('visits empty nonfinal R2 pages before all legacy KV pages', async () => {
     const list = vi
       .fn()

@@ -48,7 +48,12 @@ export function createIsrStore(bucket: R2Bucket, legacy?: KVNamespace): IsrStore
     },
     async delete(key) {
       await bucket.delete(PREFIX + key);
-      await legacy?.delete(key);
+      try {
+        await legacy?.delete(key);
+      } catch (error) {
+        // Legacy bodies are never served; their cleanup must not block the edge purge.
+        console.warn('[api] Legacy ISR KV cleanup failed.', error);
+      }
     },
     async has(key) {
       return (await bucket.head(PREFIX + key)) !== null;
