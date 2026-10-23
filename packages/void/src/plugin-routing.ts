@@ -76,15 +76,6 @@ const RESOLVE_ID_FILTER =
 const LOAD_ID_FILTER =
   /^virtual:void-(routes|client-worker(?::(react|vue|svelte|solid))?|client-browser(?::(react|vue|svelte|solid))?)$/;
 
-const SCRIPT_EXTENSIONS = ['.ts', '.mts', '.cts', '.tsx', '.js', '.mjs', '.cjs', '.jsx', '.json'];
-
-function isScriptPath(path: string): boolean {
-  return (
-    !path.includes('/node_modules/') &&
-    SCRIPT_EXTENSIONS.some((extension) => path.endsWith(extension))
-  );
-}
-
 type RoutingPluginOptions = {
   getApplicationAnalysis: (environment: RouteEnvironment, refresh?: boolean) => ApplicationAnalysis;
   isAuthEnabled: () => boolean;
@@ -161,11 +152,9 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
   const ssrDir = paths.ssrDir;
   const authConfigPaths = new Set(paths.authConfigCandidates.map((path) => normalizePath(path)));
   let authConfigEnvironment: RunnableDevEnvironment | undefined;
-  // Set when the last load failed, or a script was saved while a load ran: the
-  // file that fixes it may be one the module graph never got, so the next
-  // script save retries and the retry starts from a clean environment.
-  let authConfigRetry = false;
-  let authConfigLoading = false;
+  // Set when a file the auth config loaded changes, or a load fails, so the
+  // next load starts from an empty module graph.
+  let authConfigStale = false;
   const envFilePaths = new Set(paths.envFileCandidates.map((path) => normalizePath(path)));
   const normalizedRoutesDir = normalizePath(routesDir);
   const normalizedMiddlewareDir = normalizePath(middlewareDir);
@@ -342,40 +331,21 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
 
   async function loadAuthConfig(configPath: string | null) {
     const environment = authConfigEnvironment;
-    if (authConfigRetry && environment) {
-      // An import that failed stays in the graph under its unresolved specifier.
+    if (authConfigStale && environment) {
+      // The runner checks each import against the graph. Invalidate all of
+      // it: a failed import stays in it under the specifier it could not
+      // resolve, not under a file path.
       environment.moduleGraph.invalidateAll();
-      environment.runner.clearCache();
     }
-    authConfigRetry = false;
-    authConfigLoading = true;
+    authConfigStale = false;
     try {
       return await loadVoidAuthConfig(
         configPath,
         environment && ((path) => environment.runner.import(path)),
       );
     } catch (error) {
-      authConfigRetry = true;
+      authConfigStale = true;
       throw error;
-    } finally {
-      authConfigLoading = false;
-    }
-  }
-
-  /** Retry a failed auth config load: whether it loads now, or undefined when nothing failed. */
-  async function retryAuthConfig(logger: import('vite').Logger): Promise<boolean | undefined> {
-    if (!authConfigRetry || !compileOptions.auth) {
-      return undefined;
-    }
-    try {
-      await loadAuthConfig(compileOptions.auth.authConfigPath);
-      return true;
-    } catch (error) {
-      logger.error(error instanceof Error ? error.message : String(error), {
-        error: error instanceof Error ? error : undefined,
-        timestamp: true,
-      });
-      return false;
     }
   }
 
@@ -453,28 +423,6 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
       authConfigPaths.has(normalized) ||
       (authConfigEnvironment?.moduleGraph.getModulesByFile(normalized)?.size ?? 0) > 0
     );
-  }
-
-  /** A script save that may fix a failed load, or that a running load may import. */
-  function isAuthConfigRetryPath(path: string): boolean {
-    return (
-      compileOptions.auth !== null &&
-      (authConfigRetry || authConfigLoading) &&
-      isScriptPath(path) &&
-      !isPotentialAuthConfigPath(path)
-    );
-  }
-
-  /** Drop the evaluated auth config when one of its files changes. */
-  function invalidateAuthConfig(path: string): void {
-    const modules = authConfigEnvironment?.moduleGraph.getModulesByFile(path);
-    if (!authConfigEnvironment || !modules?.size) {
-      return;
-    }
-    for (const module of modules) {
-      authConfigEnvironment.moduleGraph.invalidateModule(module);
-    }
-    authConfigEnvironment.runner.clearCache();
   }
 
   function isPotentialEnvFilePath(path: string): boolean {
@@ -966,11 +914,13 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
       const handleFileChange = async (path: string, event: 'add' | 'change' | 'unlink') => {
         const normalizedPath = normalizePath(path);
         invalidateSourceAnalysis(normalizedPath);
-        invalidateAuthConfig(normalizedPath);
-        const authRetry = isAuthConfigRetryPath(normalizedPath);
-        if (authRetry && authConfigLoading) {
-          authConfigRetry = true;
+        const authConfigChanged = isPotentialAuthConfigPath(normalizedPath);
+        if (authConfigChanged) {
+          authConfigStale = true;
         }
+        // After a failed load, a new file may be the import that was missing.
+        const authImportCreated =
+          event === 'add' && authConfigStale && compileOptions.auth !== null;
 
         const sourceConventionChanged =
           isInDirectory(normalizedPath, normalizedRoutesDir) ||
@@ -979,8 +929,8 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
           isInDirectory(normalizedPath, normalizedQueuesDir) ||
           isInDirectory(normalizedPath, normalizedEmailDir) ||
           isInDirectory(normalizedPath, normalizedPagesDir) ||
-          isPotentialAuthConfigPath(normalizedPath) ||
-          authRetry ||
+          authConfigChanged ||
+          authImportCreated ||
           isPotentialEnvFilePath(normalizedPath);
         if (!sourceConventionChanged && !ssrEntryAbsPaths.has(normalizedPath)) {
           return;
@@ -988,19 +938,12 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
 
         const shouldRestart = await regenerateInOrder(async () => {
           invalidateSourceAnalysis(normalizedPath);
-          // The retry runs apart from this save, so a config that still fails
-          // does not stop the rest of it (a page reload, say).
-          const authRetried = authRetry
-            ? await retryAuthConfig(devServer.config.logger)
-            : undefined;
-          const authRecovered = authRetried === true;
           // Re-scan and invalidate the virtual module in ALL environments.
           // The route table virtual module lives in the workerd environment,
           // not the client — so we must iterate all environments.
           const forceRegeneration =
             event !== 'change' ||
-            authRecovered ||
-            isPotentialAuthConfigPath(normalizedPath) ||
+            authConfigChanged ||
             isPotentialEnvFilePath(normalizedPath) ||
             ssrEntryAbsPaths.has(normalizedPath);
 
@@ -1053,9 +996,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
             return true;
           }
 
-          // Generated files would fail on the same error; the next save retries.
-          const regenerate = routeInputsChanged && authRetried !== false;
-          if (regenerate) {
+          if (routeInputsChanged) {
             await writeAuthDatabaseFiles();
             writeRouteTypes();
             writeQueueTypes();
@@ -1088,7 +1029,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
               }
             }
             const mod = env.moduleGraph.getModuleById(VIRTUAL_ROUTES_ID);
-            if (mod && regenerate) {
+            if (mod && routeInputsChanged) {
               env.moduleGraph.invalidateModule(mod);
               if (structural) {
                 env.hot.send({ type: 'full-reload' });
@@ -1103,7 +1044,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
             devServer.environments.client?.hot.send({ type: 'full-reload' });
           }
 
-          if (regenerate) {
+          if (routeInputsChanged) {
             generatedRouteInputs = nextRouteInputs;
             generatedFiles = generatedFilesSignature();
           }
