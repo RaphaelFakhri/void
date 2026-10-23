@@ -777,6 +777,7 @@ export async function deployPlatformWorker(
       assertCleanPlatformWrangler(
         uploaded,
         `${options.workerExisted ? 'upload' : 'bootstrap'} ${workerName}`,
+        accountId,
       );
     } catch (error) {
       uploadError = error;
@@ -824,7 +825,7 @@ export async function deployPlatformWorker(
         directory,
         true,
       );
-      assertCleanPlatformWrangler(activated, `activate ${workerName}`);
+      assertCleanPlatformWrangler(activated, `activate ${workerName}`, accountId);
     }
     const deploymentsAfterActivation = await readPlatformWorkerDeployments(
       configPath,
@@ -1262,7 +1263,11 @@ export async function restorePlatformWorkerDeployment(input: {
     input.directory,
     true,
   );
-  assertCleanPlatformWrangler(restored, `restore deployment ${input.restoration.id}`);
+  assertCleanPlatformWrangler(
+    restored,
+    `restore deployment ${input.restoration.id}`,
+    input.accountId,
+  );
   const after = await readPlatformWorkerDeployments(
     input.configPath,
     input.accountId,
