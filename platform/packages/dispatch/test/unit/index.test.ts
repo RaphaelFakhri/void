@@ -6567,6 +6567,135 @@ describe('static asset content-type normalization', () => {
   });
 });
 
+describe('foreground worker duration', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it.each([
+    ['API mutation', '/api/email', 'POST', undefined],
+    ['SSR page', '/slow', 'GET', undefined],
+    ['ISR cache miss', '/slow', 'GET', 60],
+  ] as const)('waits for a slow %s to finish by default', async (_, path, method, revalidate) => {
+    const completed = vi.fn();
+    const { env, logWrites, analyticsWrites } = createEnv({
+      routing: {
+        workerName: 'user-app-dpl_1',
+        projectId: 'proj_1',
+        type: 'void',
+        ssr: true,
+        revalidate,
+      },
+      workerFetchImpl: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 11_000));
+        completed();
+        return new Response('completed', { headers: { 'Content-Type': 'text/html' } });
+      },
+    });
+    const responsePromise = app.fetch(
+      new Request(`https://my-app.void.app${path}`, { method }),
+      env,
+      createCtx(),
+    );
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('completed');
+    expect(completed).toHaveBeenCalledOnce();
+    expect(logWrites).toHaveLength(0);
+    expect(analyticsWrites).toHaveLength(1);
+  });
+
+  it.each([undefined, 60])(
+    'waits for a slow worker fallback with ISR TTL %s',
+    async (revalidate) => {
+      let calls = 0;
+      const { env, workerFetch, logWrites } = createEnv({
+        routing: {
+          workerName: 'user-app-dpl_1',
+          projectId: 'proj_1',
+          type: 'void',
+          ssr: true,
+          revalidate,
+          fallbackRules: [{ source: '/missing', destination: '/slow', status: 200 }],
+        },
+        workerFetchImpl: async () => {
+          if (++calls === 1) {
+            return new Response('missing', { status: 404, headers: { 'X-Void-No-Match': '1' } });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 11_000));
+          return new Response('fallback', { headers: { 'Content-Type': 'text/html' } });
+        },
+      });
+      const responsePromise = app.fetch(
+        new Request('https://my-app.void.app/missing'),
+        env,
+        createCtx(),
+      );
+      await vi.advanceTimersByTimeAsync(11_000);
+
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('fallback');
+      expect(workerFetch).toHaveBeenCalledTimes(2);
+      expect(logWrites).toHaveLength(0);
+    },
+  );
+
+  it('keeps a separate bounded storage budget after a slow worker returns an asset stub', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const stubBody = 'Assets have not yet been deployed to this script.\n';
+      const { env, logWrites } = createEnv({
+        routing: {
+          workerName: 'user-app-dpl_1',
+          projectId: 'proj_1',
+          type: 'void',
+          ssr: true,
+          assetManifestId: 'deploy-1',
+          assetConfig: { run_worker_first: true },
+        },
+        assetManifest: { '/bundle.js': '!bundle' },
+        workerFetchImpl: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 11_000));
+          return new Response(stubBody, {
+            headers: {
+              'Content-Type': 'text/plain;charset=UTF-8',
+              'Content-Length': String(stubBody.length),
+            },
+          });
+        },
+      });
+      const get = vi.fn(() => new Promise<R2ObjectBody | null>(() => {}));
+      Object.assign(env, { STATIC_ASSETS_R2: { get } });
+      let settled = false;
+      const responsePromise = app
+        .fetch(
+          new Request('https://my-app.void.app/bundle.js', { headers: { Cookie: 'a=1' } }),
+          env,
+          createCtx(),
+        )
+        .then((response) => {
+          settled = true;
+          return response;
+        });
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(get).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      const response = await responsePromise;
+      expect(response.status).toBe(503);
+      expect(response.headers.get('X-Void-Timeout')).toBe('static-asset');
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(logWrites).toHaveLength(0);
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
 describe('worker timeout explains itself in the project log stream', () => {
   // A worker cut at the dispatch budget returns nothing, so it logs nothing and
   // `void project logs` was empty for the one failure users most need
