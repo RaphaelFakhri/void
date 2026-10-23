@@ -669,7 +669,9 @@ describe('ownership-period account usage', () => {
     );
     expect(graphqlQueries).toHaveLength(1);
     expect(graphqlQueries[0]).toContain(
-      `metadata_projectId: "${await deriveAiUsageTag(JWT_SECRET, project.id)}"`,
+      `metadataRaw: ${JSON.stringify(
+        JSON.stringify({ projectId: await deriveAiUsageTag(JWT_SECRET, project.id) }),
+      )}`,
     );
     expect(graphqlQueries[0]).toContain(`datetime_geq: "${ownedFrom.toISOString()}"`);
     expect(graphqlQueries[0]).toContain(`datetime_lt: "${transferredAt.toISOString()}"`);
