@@ -594,6 +594,57 @@ it('resumes a credential update that stopped before activating any Worker', asyn
   expect(stagedKeys(resumed.manifest, 5)).toEqual([...WORKER_KEYS].sort());
 });
 
+it('resumes when the next pending generation is saved before its encrypted checkpoint', async () => {
+  const cloud = await createFakeCloudflare();
+  const installed = await runInstall(cloud, null);
+  const existing = {
+    ...installed.manifest,
+    deployment: createPlatformDeploymentManifest({
+      ...installed.manifest.deployment,
+      authentication: { ...installed.manifest.deployment.authentication, configurable: true },
+    }),
+  };
+  await expect(
+    runInstall(cloud, existing, {
+      secrets: rotateSecrets(existing),
+      verifyHealth: async () => {
+        throw new Error('network unavailable');
+      },
+    }),
+  ).rejects.toThrow('network unavailable');
+  const failed = currentManifest();
+  const intentId = resumeSecrets(failed).pendingWorkerSecretUpdateIntent!.id;
+  const put = cloud.client.putKvValue;
+  let stopped = false;
+  cloud.client.putKvValue = async (...args) => {
+    await put(...args);
+    if (
+      !stopped &&
+      args[2] === PLATFORM_REMOTE_INSTALLATION_MANIFEST_KEY &&
+      workerStepKeys(JSON.parse(args[3])).includes('worker-secret-updates:4:pending')
+    ) {
+      stopped = true;
+      throw new Error('interrupted after next pending marker');
+    }
+  };
+  await expect(runInstall(cloud, failed, { secrets: resumeSecrets(failed) })).rejects.toThrow(
+    'interrupted after next pending marker',
+  );
+  const checkpoint = currentManifest();
+  expect(workerStepKeys(checkpoint)).toContain('worker-secret-updates:4:pending');
+  expect(stagedKeys(checkpoint, 4)).toEqual([]);
+  const recovered = resumeSecrets(checkpoint);
+  expect(recovered.pendingWorkerSecretUpdateIntent).toMatchObject({
+    id: intentId,
+    updates: { CF_API_TOKEN: 'rotated-runtime-token' },
+  });
+  const routing = checkpoint.resources.find((resource) => resource.key === 'routing-kv')!;
+  expect(cloud.kv.has(`${routing.id}/${PLATFORM_DISABLED_KEY}`)).toBe(true);
+  const resumed = await runInstall(cloud, checkpoint, { secrets: recovered });
+  expect(resumed.manifest.status).toBe('installed');
+  expect(cloud.kv.has(`${routing.id}/${PLATFORM_DISABLED_KEY}`)).toBe(false);
+});
+
 it('still restores a failed cutover without credential updates', async () => {
   const cloud = await createFakeCloudflare();
   const installed = await runInstall(cloud, null);

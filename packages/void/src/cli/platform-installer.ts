@@ -714,6 +714,13 @@ export async function installPlatform(
     }));
     state.workerCutoverGeneration = nextWorkerCutoverGeneration(state.manifest);
     if (state.workerSecretUpdateIntent) {
+      // Keep this authorized intent resumable on either side of the next
+      // manifest checkpoint before binding it to the new generation.
+      state.workerSecretUpdateIntent = { ...state.workerSecretUpdateIntent, generation: null };
+      writePendingInstallationSecrets(
+        state.manifest,
+        secretCheckpoint(state.secrets, state.workerSecretUpdateIntent),
+      );
       state.manifest = recordWorkerSecretUpdateState(
         state.manifest,
         state.workerCutoverGeneration,
