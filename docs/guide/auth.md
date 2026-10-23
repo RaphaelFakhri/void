@@ -186,7 +186,7 @@ For the full set of available options, see the official [Better Auth options ref
 
 ## Database and Migrations
 
-Auth tables live alongside your app's tables. During local development, Void creates them automatically. While the dev server runs, saving `auth.ts`, or a local ES module it imports, updates the auth schema Void generates for your app. Files loaded as CommonJS or with `require()` need a dev server restart, and Void logs a warning when one changes. New auth tables and columns are created in the local database the next time the dev server starts.
+Auth tables live alongside your app's tables. During local development, Void creates them automatically. While the dev server runs, saving `auth.ts`, or a local file it imports, updates the auth schema Void generates for your app. New auth tables and columns are created in the local database the next time the dev server starts.
 
 Void platforms create auth tables automatically. For a direct Cloudflare deploy, include them in your checked-in migrations:
 

@@ -1,16 +1,15 @@
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, resolve } from 'pathslash';
-import { normalizePath, type Plugin } from 'vite';
+import {
+  createRunnableDevEnvironment,
+  isRunnableDevEnvironment,
+  normalizePath,
+  type Plugin,
+  type ResolvedConfig,
+  type RunnableDevEnvironment,
+} from 'vite';
 import type { ApplicationAnalysis } from './application-analysis.ts';
 import { completeApplicationAnalysis } from './application-routing.ts';
 import {
@@ -24,7 +23,7 @@ import {
   isGeneratedAssetHeaders,
   resolveAssetWorkerBypass,
 } from './asset-worker-bypass.ts';
-import { loadVoidAuthConfigWithDependencies, type LoadedVoidAuthConfig } from './auth/config.ts';
+import { AUTH_CONFIG_ENVIRONMENT, loadVoidAuthConfig } from './auth/config.ts';
 import { resolveDistDir, resolveWorkerDirName } from './cli/build-output-dir.ts';
 import { lintRoutingPhases, mergeRoutingRules } from './cli/headers.ts';
 import { stampClientAssetCachePolicy } from './client-asset-manifest.ts';
@@ -161,13 +160,11 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
   const pagesDir = paths.pagesDir;
   const ssrDir = paths.ssrDir;
   const authConfigPaths = new Set(paths.authConfigCandidates.map((path) => normalizePath(path)));
-  // Local files the auth config imported when it was last loaded.
-  let authConfigDependencies = new Set<string>();
-  // Those of them Node keeps cached (CommonJS, `require()`) until a restart.
-  let authConfigRestartFiles = new Set<string>();
-  // A failed load may stop at a missing or broken file it never reported.
-  let authConfigLoadFailed = false;
-  // A file saved during a load may be one the load is about to report.
+  let authConfigEnvironment: RunnableDevEnvironment | undefined;
+  // Set when the last load failed, or a script was saved while a load ran: the
+  // file that fixes it may be one the module graph never got, so the next
+  // script save retries and the retry starts from a clean environment.
+  let authConfigRetry = false;
   let authConfigLoading = false;
   const envFilePaths = new Set(paths.envFileCandidates.map((path) => normalizePath(path)));
   const normalizedRoutesDir = normalizePath(routesDir);
@@ -343,35 +340,57 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
     return parts.join('|');
   }
 
+  async function loadAuthConfig(configPath: string | null) {
+    const environment = authConfigEnvironment;
+    if (authConfigRetry && environment) {
+      // An import that failed stays in the graph under its unresolved specifier.
+      environment.moduleGraph.invalidateAll();
+      environment.runner.clearCache();
+    }
+    authConfigRetry = false;
+    authConfigLoading = true;
+    try {
+      return await loadVoidAuthConfig(
+        configPath,
+        environment && ((path) => environment.runner.import(path)),
+      );
+    } catch (error) {
+      authConfigRetry = true;
+      throw error;
+    } finally {
+      authConfigLoading = false;
+    }
+  }
+
+  /** Retry a failed auth config load: whether it loads now, or undefined when nothing failed. */
+  async function retryAuthConfig(logger: import('vite').Logger): Promise<boolean | undefined> {
+    if (!authConfigRetry || !compileOptions.auth) {
+      return undefined;
+    }
+    try {
+      await loadAuthConfig(compileOptions.auth.authConfigPath);
+      return true;
+    } catch (error) {
+      logger.error(error instanceof Error ? error.message : String(error), {
+        error: error instanceof Error ? error : undefined,
+        timestamp: true,
+      });
+      return false;
+    }
+  }
+
   async function writeAuthDatabaseFiles(): Promise<void> {
     if (!compileOptions.auth) {
-      authConfigDependencies = new Set();
-      authConfigRestartFiles = new Set();
-      authConfigLoadFailed = false;
       return;
     }
 
     // Better Auth's schema helpers load zod and most of better-auth; only auth apps need them.
     const { generateVoidAuthDatabaseModule, generateVoidAuthDrizzleSchema } =
       await import('./auth/drizzle.ts');
-    let loaded: LoadedVoidAuthConfig;
-    authConfigLoading = true;
-    try {
-      loaded = await loadVoidAuthConfigWithDependencies(compileOptions.auth.authConfigPath);
-    } catch (error) {
-      authConfigLoadFailed = true;
-      throw error;
-    } finally {
-      authConfigLoading = false;
-    }
-    authConfigLoadFailed = false;
-    // A helper the config imports changes the generated schema like the config does.
-    authConfigDependencies = new Set(loaded.dependencies.map((path) => normalizePath(path)));
-    authConfigRestartFiles = new Set(loaded.restartRequired.map((path) => normalizePath(path)));
     const authRuntime: VoidAuthRuntimeOptions = {
       dialect: compileOptions.auth.dialect,
       providers: compileOptions.auth.providers,
-      userConfig: loaded.config,
+      userConfig: await loadAuthConfig(compileOptions.auth.authConfigPath),
     };
     const local = resolvedConfig?.command === 'serve' ? loadLocalEnv(root) : {};
     const env = { ...local, ...process.env } as Record<string, unknown>;
@@ -430,31 +449,32 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
 
   function isPotentialAuthConfigPath(path: string): boolean {
     const normalized = normalizePath(path);
-    if (authConfigPaths.has(normalized)) {
-      return true;
-    }
-    if ((authConfigLoadFailed || authConfigLoading) && isScriptPath(normalized)) {
-      // Creating or fixing the file the last load stopped at must retry it.
-      return true;
-    }
-    return isAuthConfigFile(authConfigDependencies, normalized);
+    return (
+      authConfigPaths.has(normalized) ||
+      (authConfigEnvironment?.moduleGraph.getModulesByFile(normalized)?.size ?? 0) > 0
+    );
   }
 
-  function isAuthConfigFile(files: Set<string>, normalized: string): boolean {
-    if (files.size === 0) {
-      return false;
+  /** A script save that may fix a failed load, or that a running load may import. */
+  function isAuthConfigRetryPath(path: string): boolean {
+    return (
+      compileOptions.auth !== null &&
+      (authConfigRetry || authConfigLoading) &&
+      isScriptPath(path) &&
+      !isPotentialAuthConfigPath(path)
+    );
+  }
+
+  /** Drop the evaluated auth config when one of its files changes. */
+  function invalidateAuthConfig(path: string): void {
+    const modules = authConfigEnvironment?.moduleGraph.getModulesByFile(path);
+    if (!authConfigEnvironment || !modules?.size) {
+      return;
     }
-    if (files.has(normalized)) {
-      return true;
+    for (const module of modules) {
+      authConfigEnvironment.moduleGraph.invalidateModule(module);
     }
-    // The loader reports real paths; the watcher reports them under the root as
-    // written, which can go through a symlink.
-    try {
-      return files.has(normalizePath(realpathSync(normalized)));
-    } catch {
-      // A deleted file keeps the path the watcher gave.
-      return false;
-    }
+    authConfigEnvironment.runner.clearCache();
   }
 
   function isPotentialEnvFilePath(path: string): boolean {
@@ -670,6 +690,25 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
     config(_, env) {
       previewing = env.isPreview === true;
       routeEnvironment = env.command === 'serve' && !env.isPreview ? 'dev' : 'prod';
+      // Dev only, so builds never see the environment.
+      const authConfigEnvironmentConfig =
+        routeEnvironment === 'dev'
+          ? {
+              environments: {
+                [AUTH_CONFIG_ENVIRONMENT]: {
+                  consumer: 'server' as const,
+                  dev: {
+                    createEnvironment: (name: string, config: ResolvedConfig) =>
+                      // Void invalidates it on saves; no HMR client to run.
+                      createRunnableDevEnvironment(name, config, {
+                        hot: false,
+                        runnerOptions: { hmr: false },
+                      }),
+                  },
+                },
+              },
+            }
+          : {};
       compileOptions.hasLive = options.live !== undefined;
       compileOptions.managedDispatch =
         !options.target && env.command === 'build' && Boolean(process.env.VOID_DEPLOY_PROJECT_ID);
@@ -689,12 +728,12 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
           }
         });
 
-        return { resolve: { alias: resolvedAliases } };
+        return { ...authConfigEnvironmentConfig, resolve: { alias: resolvedAliases } };
       }
 
       const entries = validateSsrEntries(root, paths);
       if (env.command !== 'build') {
-        return;
+        return authConfigEnvironmentConfig;
       }
 
       return {
@@ -908,18 +947,29 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
       },
     },
 
+    hotUpdate() {
+      // Void invalidates this environment itself; Vite's update pass would
+      // only log a page reload that nothing receives.
+      if (this.environment.name === AUTH_CONFIG_ENVIRONMENT) {
+        return [];
+      }
+    },
+
     configureServer(devServer) {
+      const authEnvironment = devServer.environments[AUTH_CONFIG_ENVIRONMENT];
+      authConfigEnvironment =
+        authEnvironment && isRunnableDevEnvironment(authEnvironment) ? authEnvironment : undefined;
+
       // Watch the source convention directories for file changes
       const watcher = devServer.watcher;
 
       const handleFileChange = async (path: string, event: 'add' | 'change' | 'unlink') => {
         const normalizedPath = normalizePath(path);
         invalidateSourceAnalysis(normalizedPath);
-        if (event === 'change' && isAuthConfigFile(authConfigRestartFiles, normalizedPath)) {
-          devServer.config.logger.warn(
-            `auth: ${relative(root, normalizedPath)} is loaded as CommonJS or with require(); restart the dev server to apply its changes.`,
-            { timestamp: true },
-          );
+        invalidateAuthConfig(normalizedPath);
+        const authRetry = isAuthConfigRetryPath(normalizedPath);
+        if (authRetry && authConfigLoading) {
+          authConfigRetry = true;
         }
 
         const sourceConventionChanged =
@@ -930,6 +980,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
           isInDirectory(normalizedPath, normalizedEmailDir) ||
           isInDirectory(normalizedPath, normalizedPagesDir) ||
           isPotentialAuthConfigPath(normalizedPath) ||
+          authRetry ||
           isPotentialEnvFilePath(normalizedPath);
         if (!sourceConventionChanged && !ssrEntryAbsPaths.has(normalizedPath)) {
           return;
@@ -937,11 +988,18 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
 
         const shouldRestart = await regenerateInOrder(async () => {
           invalidateSourceAnalysis(normalizedPath);
+          // The retry runs apart from this save, so a config that still fails
+          // does not stop the rest of it (a page reload, say).
+          const authRetried = authRetry
+            ? await retryAuthConfig(devServer.config.logger)
+            : undefined;
+          const authRecovered = authRetried === true;
           // Re-scan and invalidate the virtual module in ALL environments.
           // The route table virtual module lives in the workerd environment,
           // not the client — so we must iterate all environments.
           const forceRegeneration =
             event !== 'change' ||
+            authRecovered ||
             isPotentialAuthConfigPath(normalizedPath) ||
             isPotentialEnvFilePath(normalizedPath) ||
             ssrEntryAbsPaths.has(normalizedPath);
@@ -995,7 +1053,9 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
             return true;
           }
 
-          if (routeInputsChanged) {
+          // Generated files would fail on the same error; the next save retries.
+          const regenerate = routeInputsChanged && authRetried !== false;
+          if (regenerate) {
             await writeAuthDatabaseFiles();
             writeRouteTypes();
             writeQueueTypes();
@@ -1028,7 +1088,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
               }
             }
             const mod = env.moduleGraph.getModuleById(VIRTUAL_ROUTES_ID);
-            if (mod && routeInputsChanged) {
+            if (mod && regenerate) {
               env.moduleGraph.invalidateModule(mod);
               if (structural) {
                 env.hot.send({ type: 'full-reload' });
@@ -1043,7 +1103,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
             devServer.environments.client?.hot.send({ type: 'full-reload' });
           }
 
-          if (routeInputsChanged) {
+          if (regenerate) {
             generatedRouteInputs = nextRouteInputs;
             generatedFiles = generatedFilesSignature();
           }
