@@ -131,3 +131,5 @@ logger.error('webhook failed', { provider: 'stripe', attempt: 3 });
 ```
 
 **Methods:** `logger.error(message, fields?)`, `logger.warn(message, fields?)`, `logger.info(message, fields?)`.
+
+An `Error` in `fields` is logged with its `name`, `message`, `stack`, `cause` and own fields, so you can pass a caught error directly: `logger.error('save failed', { error })`.
